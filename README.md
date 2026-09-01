@@ -15,7 +15,7 @@
 
 ## Графическое приложение
 
-![Интерфейс Gemini Transcribe](ui.jpg)
+![Интерфейс Gemini Transcribe](./img/ui.jpg)
 
 В проекте есть GUI на PySide6 (`gui.py`) с тёмной профессиональной темой. Он поддерживает:
 
