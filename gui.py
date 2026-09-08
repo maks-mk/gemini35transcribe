@@ -1,8 +1,12 @@
+import asyncio
 import json
 import os
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 if sys.platform == "win32":
     import ctypes
@@ -10,6 +14,7 @@ if sys.platform == "win32":
 import qtawesome as qta
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont
 from PySide6.QtWidgets import (
@@ -17,6 +22,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QButtonGroup,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -33,7 +39,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from transcribe import MODEL, format_annotated_transcript
+from transcribe import (
+    MODEL,
+    REQUEST_TIMEOUT_MS,
+    TranscriptionCancelled,
+    delete_uploaded_file,
+    download_audio,
+    format_annotated_transcript,
+    format_error_message,
+)
 
 
 def _load_api_key():
@@ -51,42 +65,151 @@ def _load_api_key():
 class TranscriptionWorker(QObject):
     finished = Signal(str, str, float, float)
     failed = Signal(str)
+    stopped = Signal()
     status = Signal(str)
+    progress = Signal(int)
 
-    def __init__(self, audio_path, output_path, json_path, config):
+    def __init__(self, source, source_is_url, output_path, json_path, config):
         super().__init__()
-        self.audio_path = audio_path
+        self.source = source
+        self.source_is_url = source_is_url
         self.output_path = output_path
         self.json_path = json_path
         self.config = config
+        self.stop_event = threading.Event()
+        self.phase = "подготовка"
+        self._loop = None
+        self._task = None
+        self._uploaded_file = None
 
-    @Slot()
-    def run(self):
+    def request_stop(self):
+        self.stop_event.set()
+        loop = self._loop
+        task = self._task
+        if loop and task and not task.done():
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass
+
+    def _check_stopped(self):
+        if self.stop_event.is_set():
+            raise TranscriptionCancelled()
+
+    def _download_progress(self, downloaded, total):
+        if total:
+            percent = round(min(downloaded, total) * 100 / total)
+            self.progress.emit(percent)
+
+    def _download_audio(self, temp_dir, cookies_file=None):
+        self.phase = "загрузка аудиодорожки"
+        self.status.emit("Загрузка аудиодорожки…")
+        self.progress.emit(-1)
+        return download_audio(
+            self.source,
+            temp_dir,
+            cookies_file=cookies_file,
+            stop_event=self.stop_event,
+            progress_callback=self._download_progress,
+        )
+
+    async def _run_gemini(self, client, audio_path):
+        self._loop = asyncio.get_running_loop()
+        self._task = asyncio.current_task()
         try:
-            api_key, env_path = _load_api_key()
-            if not api_key:
-                raise RuntimeError(f"Ключ GEMINI_API_KEY не найден в файле {env_path}")
+            self._check_stopped()
+            self._uploaded_file = await client.aio.files.upload(file=str(audio_path))
+            self._check_stopped()
 
-            client = genai.Client(api_key=api_key)
-            self.status.emit("Загрузка аудиофайла…")
-            started = time.perf_counter()
-            audio_file = client.files.upload(file=str(self.audio_path))
-
+            self.phase = "распознавание речи"
             self.status.emit("Распознавание речи…")
             transcription_started = time.perf_counter()
-            interaction = client.interactions.create(
+            self._check_stopped()
+            interaction = await client.aio.interactions.create(
                 model=MODEL,
                 input=[
                     {
                         "type": "audio",
-                        "uri": audio_file.uri,
-                        "mime_type": audio_file.mime_type,
+                        "uri": self._uploaded_file.uri,
+                        "mime_type": self._uploaded_file.mime_type,
                     }
                 ],
                 generation_config={"transcription_config": self.config},
             )
+            self._check_stopped()
+            return interaction, time.perf_counter() - transcription_started
+        finally:
+            try:
+                await client.aio.aclose()
+            except Exception as error:
+                print(f"Не удалось закрыть async-клиент Gemini: {error}", file=sys.stderr)
+            self._task = None
+            self._loop = None
 
-            transcription_elapsed = time.perf_counter() - transcription_started
+    def _write_outputs(self, text, interaction):
+        """Publish results atomically so a cancelled run leaves no partial files."""
+        payloads = [(self.output_path, text)]
+        if self.json_path:
+            payloads.append((
+                self.json_path,
+                json.dumps(interaction.model_dump(mode="json"), ensure_ascii=False, indent=2),
+            ))
+
+        staged = []
+        try:
+            for path, data in payloads:
+                temp_path = path.with_name(f"{path.name}.part")
+                temp_path.write_text(data, encoding="utf-8")
+                staged.append((temp_path, path))
+            self._check_stopped()
+            while staged:
+                temp_path, path = staged.pop()
+                os.replace(temp_path, path)
+        finally:
+            for temp_path, _path in staged:
+                temp_path.unlink(missing_ok=True)
+
+    @Slot()
+    def run(self):
+        temp_dir = None
+        client = None
+        try:
+            self.phase = "подготовка"
+            api_key, env_path = _load_api_key()
+            if not api_key:
+                raise RuntimeError(f"Ключ GEMINI_API_KEY не найден в файле {env_path}")
+            self._check_stopped()
+
+            started = time.perf_counter()
+            audio_path = Path(self.source)
+            if self.source_is_url:
+                temp_dir = tempfile.TemporaryDirectory(prefix="gemini-transcribe-")
+                cookies_file = os.getenv("YTDLP_COOKIES_FILE", "").strip()
+                if cookies_file:
+                    cookies_path = Path(cookies_file)
+                    if not cookies_path.is_absolute():
+                        cookies_path = env_path.parent / cookies_file
+                    if not cookies_path.is_file():
+                        raise RuntimeError(f"Файл cookies не найден: {cookies_path}")
+                else:
+                    cookies_path = None
+                audio_path = self._download_audio(temp_dir.name, cookies_path)
+            else:
+                self._check_stopped()
+                self.status.emit("Загрузка аудиофайла…")
+
+            self._check_stopped()
+            self.phase = "отправка файла в Gemini"
+            self.status.emit("Отправка аудиофайла в Gemini…")
+            self.progress.emit(-1)
+            client = genai.Client(
+                api_key=api_key,
+                http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
+            )
+            interaction, transcription_elapsed = asyncio.run(
+                self._run_gemini(client, audio_path)
+            )
+
             elapsed = time.perf_counter() - started
             include_speakers = self.config["mode"].get("diarization_mode") == "speaker"
             include_timestamps = bool(self.config["mode"].get("timestamp_granularities"))
@@ -95,15 +218,28 @@ class TranscriptionWorker(QObject):
                 include_speakers=include_speakers,
                 include_timestamps=include_timestamps,
             )
-            self.output_path.write_text(text, encoding="utf-8")
-            if self.json_path:
-                self.json_path.write_text(
-                    json.dumps(interaction.model_dump(mode="json"), ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
+            if not text.strip():
+                raise RuntimeError("Gemini вернул пустую расшифровку без текста в ответе")
+            self._check_stopped()
+            self._write_outputs(text, interaction)
             self.finished.emit(text, str(self.output_path), transcription_elapsed, elapsed)
-        except Exception as error:  # API errors vary by SDK version.
-            self.failed.emit(str(error))
+        except (TranscriptionCancelled, asyncio.CancelledError):
+            self.stopped.emit()
+        except Exception as error:  # API and yt-dlp errors vary by version.
+            if self.stop_event.is_set():
+                self.stopped.emit()
+            else:
+                print(f"Ошибка на этапе {self.phase}: {error}", file=sys.stderr)
+                self.failed.emit(format_error_message(error, self.phase))
+        finally:
+            if client:
+                delete_uploaded_file(client, self._uploaded_file)
+                try:
+                    client.close()
+                except Exception as error:
+                    print(f"Не удалось закрыть клиент Gemini: {error}", file=sys.stderr)
+            if temp_dir:
+                temp_dir.cleanup()
 
 
 class AudioDropEdit(QLineEdit):
@@ -133,6 +269,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.thread = None
         self.worker = None
+        self._cancel_requested = False
+        self._close_pending = False
         self.setWindowTitle("Gemini Transcribe")
         self.setMinimumSize(640, 460)
         self.setSizeIncrement(1, 1)
@@ -145,7 +283,6 @@ class MainWindow(QMainWindow):
             available.left() + (available.width() - self.width()) // 2,
             self.y(),
         )
-        self.setAcceptDrops(True)
         self._build_ui()
         self._apply_theme()
 
@@ -181,7 +318,25 @@ class MainWindow(QMainWindow):
         settings_layout.setContentsMargins(0, 0, 6, 0)
         settings_layout.setSpacing(6)
 
-        file_card = self._card("Аудиофайл", "Перетащите файл или выберите его")
+        file_card = self._card("Источник", "Файл или ссылка на видеохостинг")
+        source_mode_row = QHBoxLayout()
+        source_mode_row.setContentsMargins(0, 0, 0, 0)
+        source_mode_row.setSpacing(12)
+        self.file_source_check = QCheckBox("Локальный файл")
+        self.url_source_check = QCheckBox("Ссылка")
+        self.file_source_check.setChecked(True)
+        self.file_source_check.setToolTip("Транскрибировать аудиофайл с компьютера")
+        self.url_source_check.setToolTip("Скачать аудиодорожку по ссылке через yt-dlp")
+        self.source_group = QButtonGroup(self)
+        self.source_group.setExclusive(True)
+        self.source_group.addButton(self.file_source_check)
+        self.source_group.addButton(self.url_source_check)
+        self.file_source_check.toggled.connect(self._source_mode_changed)
+        source_mode_row.addWidget(self.file_source_check)
+        source_mode_row.addWidget(self.url_source_check)
+        source_mode_row.addStretch()
+        file_card.layout().addLayout(source_mode_row)
+
         file_row = QHBoxLayout()
         file_row.setSpacing(6)
         self.audio_edit = AudioDropEdit()
@@ -189,10 +344,10 @@ class MainWindow(QMainWindow):
         self.audio_edit.setMinimumWidth(0)
         self.audio_edit.setToolTip("Аудиофайл для транскрибации. Поддерживаются MP3, WAV, M4A, FLAC, OGG и AAC")
         self.audio_edit.file_dropped.connect(self._set_audio_path)
-        browse = self._button("fa6s.folder-open", "Обзор", "secondary")
-        browse.clicked.connect(self._browse_audio)
+        self.browse_source = self._button("fa6s.folder-open", "Обзор", "secondary")
+        self.browse_source.clicked.connect(self._source_action)
         file_row.addWidget(self.audio_edit)
-        file_row.addWidget(browse)
+        file_row.addWidget(self.browse_source)
         file_card.layout().addLayout(file_row)
         settings_layout.addWidget(file_card)
 
@@ -258,7 +413,7 @@ class MainWindow(QMainWindow):
         action_layout.setContentsMargins(12, 10, 12, 10)
         action_layout.setSpacing(8)
         self.start_button = self._button("fa6s.play", "Начать", "primary")
-        self.start_button.clicked.connect(self._start)
+        self.start_button.clicked.connect(self._start_or_stop)
         action_layout.addWidget(self.start_button)
         self.status_label = QLabel("Выберите аудиофайл")
         self.status_label.setObjectName("status")
@@ -367,11 +522,35 @@ class MainWindow(QMainWindow):
             QProgressBar::chunk { background: #71859a; border-radius: 3px; }
         """)
 
+    def _source_mode_changed(self, file_mode):
+        if file_mode:
+            self.audio_edit.setPlaceholderText("meeting.mp3")
+            self.audio_edit.setToolTip("Аудиофайл для транскрибации. Поддерживаются MP3, WAV, M4A, FLAC, OGG и AAC")
+            self.browse_source.setText("Обзор")
+            self.browse_source.setIcon(qta.icon("fa6s.folder-open", color="#b8c0cc"))
+        else:
+            self.audio_edit.setPlaceholderText("https://www.youtube.com/watch?v=…")
+            self.audio_edit.setToolTip("Ссылка на видео или аудио с YouTube, Rutube, VK и других поддерживаемых yt-dlp сайтов")
+            self.browse_source.setText("Вставить")
+            self.browse_source.setIcon(qta.icon("fa6s.link", color="#b8c0cc"))
+
+    def _source_action(self):
+        if self.url_source_check.isChecked():
+            self._paste_url()
+        else:
+            self._browse_audio()
+
     def _set_audio_path(self, path):
+        if self.url_source_check.isChecked():
+            return
         path = Path(path)
         self.audio_edit.setText(str(path))
         if not self.output_edit.text().strip():
             self.output_edit.setText(str(path.with_suffix(".txt")))
+
+    def _paste_url(self):
+        self.audio_edit.setFocus()
+        self.audio_edit.paste()
 
     def _browse_audio(self):
         path, _ = QFileDialog.getOpenFileName(self, "Выберите аудиофайл", "", "Аудио (*.mp3 *.wav *.m4a *.flac *.ogg *.aac);;Все файлы (*)")
@@ -396,16 +575,59 @@ class MainWindow(QMainWindow):
             self.speaker_check.setChecked(False)
             self.timestamp_check.setChecked(False)
 
+    def _start_or_stop(self):
+        if self.thread and self.thread.isRunning():
+            self._stop()
+        else:
+            self._start()
+
+    @staticmethod
+    def _ensure_writable(path):
+        """Fail before the API call if the result cannot be written afterwards."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_dir():
+            raise IsADirectoryError(f"путь занят каталогом: {path}")
+        if path.exists():
+            with path.open("a", encoding="utf-8"):
+                pass
+        else:
+            with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".write-check-"):
+                pass
+
     def _start(self):
-        audio_path = Path(self.audio_edit.text().strip())
-        if not audio_path.is_file():
-            QMessageBox.warning(self, "Файл не найден", "Выберите существующий аудиофайл.")
+        source = self.audio_edit.text().strip()
+        source_is_url = self.url_source_check.isChecked()
+        if not source:
+            QMessageBox.warning(self, "Источник не указан", "Укажите путь к аудиофайлу или ссылку на видео.")
             return
-        output_path = Path(self.output_edit.text().strip() or audio_path.with_suffix(".txt"))
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if source_is_url:
+            parsed_url = urlparse(source)
+            if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
+                QMessageBox.warning(self, "Некорректная ссылка", "Укажите полную ссылку, начинающуюся с http:// или https://.")
+                return
+            default_output = Path.cwd() / "transcription.txt"
+        else:
+            audio_path = Path(source)
+            if not audio_path.is_file():
+                QMessageBox.warning(self, "Файл не найден", "Выберите существующий аудиофайл.")
+                return
+            default_output = audio_path.with_suffix(".txt")
+
+        output_path = Path(self.output_edit.text().strip() or default_output)
         json_path = Path(self.json_edit.text().strip()) if self.json_edit.text().strip() else None
-        if json_path:
-            json_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._ensure_writable(output_path)
+            if json_path:
+                self._ensure_writable(json_path)
+        except OSError as error:
+            QMessageBox.warning(
+                self,
+                "Не удалось подготовить сохранение",
+                format_error_message(error, "подготовка"),
+            )
+            return
+
 
         config = {"mode": {"type": self.mode_combo.currentData()}}
         languages = [item.strip() for item in self.language_edit.text().split(",") if item.strip()]
@@ -422,38 +644,81 @@ class MainWindow(QMainWindow):
         if self.timestamp_check.isChecked():
             config["mode"]["timestamp_granularities"] = ["word"]
 
-        self.start_button.setEnabled(False)
+        self._cancel_requested = False
+        self.start_button.setText("Остановить")
+        self.start_button.setIcon(qta.icon("fa6s.stop", color="#b8c0cc"))
+        self.start_button.setEnabled(True)
+        self.progress.setRange(0, 0)
         self.progress.show()
         self.badge.setText("В РАБОТЕ")
         self.status_label.setText("Подготовка…")
         self.result_edit.clear()
         self.thread = QThread(self)
-        self.worker = TranscriptionWorker(audio_path, output_path, json_path, config)
+        self.worker = TranscriptionWorker(source, source_is_url, output_path, json_path, config)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
-        self.worker.status.connect(self.status_label.setText)
+        self.worker.status.connect(self._set_status)
+        self.worker.progress.connect(self._set_progress)
         self.worker.finished.connect(self._success)
         self.worker.failed.connect(self._failure)
+        self.worker.stopped.connect(self._stopped)
         self.worker.finished.connect(self.thread.quit)
         self.worker.failed.connect(self.thread.quit)
+        self.worker.stopped.connect(self.thread.quit)
         self.thread.finished.connect(self._thread_finished)
         self.thread.start()
 
+
+    @Slot(str)
+    def _set_status(self, message):
+        if not self._cancel_requested:
+            self.status_label.setText(message)
+
+    @Slot(int)
+    def _set_progress(self, percent):
+        if self._cancel_requested:
+            return
+        if percent >= 0:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(percent)
+        else:
+            self.progress.setRange(0, 0)
+
+    @Slot()
+    def _stop(self):
+        if not self.worker or not self.thread or not self.thread.isRunning():
+            return
+        self._cancel_requested = True
+        self.start_button.setEnabled(False)
+        self.status_label.setText("Остановка операции…")
+        self.badge.setText("ОСТАНОВКА")
+        self.worker.request_stop()
+
     @Slot(str, str, float, float)
     def _success(self, text, output, transcription_time, total_time):
+        if self._cancel_requested:
+            return
         self.result_edit.setPlainText(text)
         self.status_label.setText(f"Готово · распознавание {transcription_time:.1f} с · всего {total_time:.1f} с")
         self.badge.setText("ГОТОВО")
         self.progress.hide()
-        self.start_button.setEnabled(True)
 
     @Slot(str)
     def _failure(self, message):
+        if self._cancel_requested:
+            return
         self.status_label.setText("Ошибка обработки")
         self.badge.setText("ОШИБКА")
         self.progress.hide()
-        self.start_button.setEnabled(True)
         QMessageBox.critical(self, "Ошибка транскрибации", message)
+
+    @Slot()
+    def _stopped(self):
+        self._cancel_requested = True
+        self.status_label.setText("Остановлено пользователем")
+        self.badge.setText("ОСТАНОВЛЕНО")
+        self.progress.hide()
+
 
     def _thread_finished(self):
         if self.worker:
@@ -462,13 +727,21 @@ class MainWindow(QMainWindow):
             self.thread.deleteLater()
         self.worker = None
         self.thread = None
+        self._cancel_requested = False
+        self.start_button.setText("Начать")
+        self.start_button.setIcon(qta.icon("fa6s.play", color="#b8c0cc"))
+        self.start_button.setEnabled(True)
+        if self._close_pending:
+            self.close()
 
     def closeEvent(self, event):
         if self.thread and self.thread.isRunning():
-            QMessageBox.information(self, "Операция выполняется", "Дождитесь завершения транскрибации перед закрытием окна.")
+            self._close_pending = True
+            self._stop()
             event.ignore()
             return
         event.accept()
+
 
 
 def main():

@@ -29,7 +29,7 @@ if not exist "%ENV_FILE%" (
 )
 
 echo [INFO] Building %APP_NAME%...
-"%PYTHON%" -m PyInstaller --name "%APP_NAME%" --onefile --windowed --clean --noconfirm --paths . --icon "%ICON%" --collect-all qtawesome --collect-all google.genai --hidden-import PySide6.QtSvg "%ENTRY%"
+"%PYTHON%" -m PyInstaller --name "%APP_NAME%" --onefile --windowed --clean --noconfirm --paths . --icon "%ICON%" --collect-all qtawesome --collect-all google.genai --collect-all yt_dlp --hidden-import PySide6.QtSvg "%ENTRY%"
 
 set "BUILD_EXIT=%ERRORLEVEL%"
 if not "%BUILD_EXIT%"=="0" (
